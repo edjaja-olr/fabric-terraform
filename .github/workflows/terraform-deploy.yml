@@ -1,0 +1,252 @@
+name: "Terraform · Microsoft Fabric Medallion"
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "**.tf"
+      - "**.tfvars"
+      - ".github/workflows/terraform-deploy.yml"
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "**.tf"
+      - "**.tfvars"
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "Terraform action to run"
+        required: true
+        default: "plan"
+        type: choice
+        options:
+          - plan
+          - apply
+          - destroy
+
+permissions:
+  contents: read
+  pull-requests: write   # allows the bot to comment plan output on PRs
+  id-token: write        # required for OIDC / federated credentials
+
+env:
+  TF_VERSION: "1.10.5"
+  TF_WORKING_DIR: "."
+  ARM_CLIENT_ID:       ${{ secrets.AZURE_CLIENT_ID }}
+  ARM_CLIENT_SECRET:   ${{ secrets.AZURE_CLIENT_SECRET }}
+  ARM_TENANT_ID:       ${{ secrets.AZURE_TENANT_ID }}
+  ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+jobs:
+  # ────────────────────────────────────────────
+  # VALIDATE  (runs on every push / PR)
+  # ────────────────────────────────────────────
+  validate:
+    name: "Validate & Lint"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Format Check
+        id: fmt
+        run: terraform fmt -check -recursive
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        continue-on-error: true
+
+      - name: Terraform Init
+        id: init
+        run: |
+          terraform init \
+            -backend=false \
+            -input=false
+        working-directory: ${{ env.TF_WORKING_DIR }}
+
+      - name: Terraform Validate
+        id: validate
+        run: terraform validate -no-color
+        working-directory: ${{ env.TF_WORKING_DIR }}
+
+      # Post validation summary to PR
+      - name: Comment on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const output = `### Terraform Validation
+            | Step | Result |
+            |------|--------|
+            | Format | ${{ steps.fmt.outcome == 'success' && '✅ Pass' || '⚠️ Diff found (non-blocking)' }} |
+            | Init   | ${{ steps.init.outcome == 'success' && '✅ Pass' || '❌ Fail' }} |
+            | Validate | ${{ steps.validate.outcome == 'success' && '✅ Pass' || '❌ Fail' }} |
+            `;
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
+            });
+
+  # ────────────────────────────────────────────
+  # PLAN  (runs on every push / PR)
+  # ────────────────────────────────────────────
+  plan:
+    name: "Terraform Plan"
+    runs-on: ubuntu-latest
+    needs: validate
+    env:
+      TF_VAR_azure_subscription_id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      TF_VAR_azure_tenant_id:       ${{ secrets.AZURE_TENANT_ID }}
+      TF_VAR_spn_client_id:         ${{ secrets.AZURE_CLIENT_ID }}
+      TF_VAR_spn_client_secret:     ${{ secrets.AZURE_CLIENT_SECRET }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -input=false \
+            -reconfigure
+        working-directory: ${{ env.TF_WORKING_DIR }}
+
+      - name: Terraform Plan
+        id: plan
+        run: |
+          terraform plan \
+            -var-file="environments/demo/terraform.tfvars" \
+            -out=tfplan \
+            -input=false \
+            -no-color \
+            2>&1 | tee plan_output.txt
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        continue-on-error: true
+
+      - name: Upload Plan Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan
+          path: |
+            tfplan
+            plan_output.txt
+          retention-days: 7
+
+      - name: Post Plan to PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const plan = fs.readFileSync('plan_output.txt', 'utf8').slice(0, 65000);
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `### Terraform Plan\n\`\`\`\n${plan}\n\`\`\``
+            });
+
+  # ────────────────────────────────────────────
+  # APPLY  (only on main branch push OR manual dispatch with action=apply)
+  # ────────────────────────────────────────────
+  apply:
+    name: "Terraform Apply – Demo"
+    runs-on: ubuntu-latest
+    needs: plan
+    if: |
+      (github.ref == 'refs/heads/main' && github.event_name == 'push') ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'apply')
+    environment:
+      name: demo
+      # Requires a "demo" GitHub Environment with required reviewers for a
+      # manual approval gate before apply executes.
+    env:
+      TF_VAR_azure_subscription_id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      TF_VAR_azure_tenant_id:       ${{ secrets.AZURE_TENANT_ID }}
+      TF_VAR_spn_client_id:         ${{ secrets.AZURE_CLIENT_ID }}
+      TF_VAR_spn_client_secret:     ${{ secrets.AZURE_CLIENT_SECRET }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -input=false \
+            -reconfigure
+        working-directory: ${{ env.TF_WORKING_DIR }}
+
+      - name: Terraform Apply
+        run: |
+          terraform apply \
+            -var-file="environments/demo/terraform.tfvars" \
+            -auto-approve \
+            -input=false
+        working-directory: ${{ env.TF_WORKING_DIR }}
+
+      - name: Capture Outputs
+        run: terraform output -json > tf_outputs.json
+        working-directory: ${{ env.TF_WORKING_DIR }}
+
+      - name: Upload Outputs Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tf-outputs
+          path: tf_outputs.json
+          retention-days: 30
+
+  # ────────────────────────────────────────────
+  # DESTROY  (manual dispatch only)
+  # ────────────────────────────────────────────
+  destroy:
+    name: "Terraform Destroy – Demo"
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'destroy'
+    environment:
+      name: demo  # Requires approval gate
+    env:
+      TF_VAR_azure_subscription_id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      TF_VAR_azure_tenant_id:       ${{ secrets.AZURE_TENANT_ID }}
+      TF_VAR_spn_client_id:         ${{ secrets.AZURE_CLIENT_ID }}
+      TF_VAR_spn_client_secret:     ${{ secrets.AZURE_CLIENT_SECRET }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init
+        run: terraform init -input=false -reconfigure
+        working-directory: ${{ env.TF_WORKING_DIR }}
+
+      - name: Terraform Destroy
+        run: |
+          terraform destroy \
+            -var-file="environments/demo/terraform.tfvars" \
+            -auto-approve \
+            -input=false
+        working-directory: ${{ env.TF_WORKING_DIR }}
